@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rastreador Wayback de canales de YouTube</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;line-height:1.5}
+  input[type=text]{width:100%;padding:.5rem;box-sizing:border-box}
+  input[type=number]{width:5rem}
+  button{padding:.5rem 1rem;margin:.5rem .5rem .5rem 0;cursor:pointer}
+  #bar{height:8px;background:#ddd;border-radius:4px;overflow:hidden;margin:.5rem 0}
+  #fill{height:100%;width:0;background:#2a7}
+  #log{font-family:monospace;font-size:.85rem;max-height:300px;overflow:auto;white-space:pre-wrap}
+  .ok{color:#080}.no{color:#a00}.in{color:#666}
+</style>
+</head>
+<body>
+<h1>Rastrear canal en Wayback</h1>
+<p>Pegá el link del canal (<code>/channel/UC…</code> o <code>@handle</code>) o el ID <code>UC…</code>. Se buscan capturas archivadas del canal, se extraen los videos, se descartan los que siguen en YouTube y se buscan capturas de los restantes.</p>
+<input type="text" id="chan" placeholder="https://www.youtube.com/@canal  o  UCxxxxxxxxxxxxxxxxxxxxxx">
+<p>Máx. capturas del canal a leer: <input type="number" id="maxcap" value="80" min="5" max="500">
+ <label><input type="checkbox" id="all"> incluir también los que siguen disponibles</label></p>
+<div>
+  <button id="go">Rastrear</button>
+  <button id="dl" disabled>Descargar txt</button>
+</div>
+<div id="bar"><div id="fill"></div></div>
+<div id="status"></div>
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+// Pegá acá la URL de tu Cloudflare Worker, sin barra final. Ej: "https://cors.tuusuario.workers.dev"
+const PROXY = "https://cors.tuffceibalarchive.workers.dev";
+const via = u => PROXY ? PROXY + "?u=" + encodeURIComponent(u) : u;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const out = [];
+const log = (h, c = "in") => { const d = $("log"); d.innerHTML += `<span class="${c}">${h}</span>\n`; d.scrollTop = d.scrollHeight; };
+const status = t => $("status").textContent = t;
+const progress = p => $("fill").style.width = (100 * p) + "%";
+
+function parseChannel(s) {
+  s = s.trim();
+  let m = s.match(/channel\/(UC[\w-]{22})/) || s.match(/^(UC[\w-]{22})$/);
+  if (m) return { id: m[1] };
+  m = s.match(/@([\w.\-%]+)/) || s.match(/^([\w.\-]+)$/);
+  return m ? { handle: m[1] } : null;
+}
+
+async function cdx(params, tries = 3) {
+  const u = via("https://web.archive.org/cdx/search/cdx?output=json&" + new URLSearchParams(params));
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(u);
+      if (r.status === 429 || r.status >= 500) { await sleep(2000 * (i + 1)); continue; }
+      const t = await r.text();
+      if (!t.trim()) return [];
+      return JSON.parse(t).slice(1);
+    } catch (e) { await sleep(1500 * (i + 1)); }
+  }
+  throw new Error("CDX sin respuesta");
+}
+
+async function fetchRaw(ts, orig, tries = 2) {
+  const u = via(`https://web.archive.org/web/${ts}id_/${orig}`);
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(u);
+      if (r.ok) return await r.text();
+      if (r.status === 429) await sleep(2500);
+    } catch (e) { await sleep(1000); }
+  }
+  return null;
+}
+
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (i < items.length) { const x = items[i++]; await fn(x); await sleep(250); }
+  }));
+}
+
+async function resolveHandle(handle) {
+  const rows = await cdx({ url: `youtube.com/@${handle}`, matchType: "prefix",
+    filter: "statuscode:200", fl: "timestamp,original", limit: "8" });
+  for (const [ts, orig] of rows) {
+    const html = await fetchRaw(ts, orig);
+    const m = html && html.match(/"(?:channelId|externalId)":"(UC[\w-]{22})"/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function sample(arr, n) {
+  if (arr.length <= n) return arr;
+  const r = [];
+  for (let i = 0; i < n; i++) r.push(arr[Math.floor(i * arr.length / n)]);
+  return r;
+}
+
+function extractIds(html) {
+  const ids = new Set();
+  for (const re of [/"videoId":"([\w-]{11})"/g, /watch\?v=([\w-]{11})/g, /ytimg\.com\/vi\/([\w-]{11})\//g])
+    for (const m of html.matchAll(re)) ids.add(m[1]);
+  return ids;
+}
+
+// true = disponible, false = borrado/privado, null = no se pudo comprobar
+async function available(id) {
+  try {
+    const r = await fetch(via("https://www.youtube.com/oembed?format=json&url=" +
+      encodeURIComponent("https://www.youtube.com/watch?v=" + id)));
+    return r.ok;
+  } catch (e) { return null; }
+}
+
+$("go").onclick = async () => {
+  const ch = parseChannel($("chan").value);
+  if (!ch) { status("No entendí el canal."); return; }
+  out.length = 0; $("log").innerHTML = ""; $("dl").disabled = true; $("go").disabled = true; progress(0);
+  try {
+    let id = ch.id, handle = ch.handle;
+    if (!id) {
+      status("Resolviendo @" + handle + " …");
+      id = await resolveHandle(handle);
+      if (!id) { log("No pude obtener el ID del canal desde Wayback. Probá con el ID UC… directo.", "no"); return; }
+      log("Canal: " + id, "ok");
+    }
+
+    status("Buscando capturas del canal …");
+    let rows = await cdx({ url: `youtube.com/channel/${id}`, matchType: "prefix",
+      filter: "statuscode:200", collapse: "timestamp:6", fl: "timestamp,original", limit: "5000" });
+    if (handle) rows = rows.concat(await cdx({ url: `youtube.com/@${handle}`, matchType: "prefix",
+      filter: "statuscode:200", collapse: "timestamp:6", fl: "timestamp,original", limit: "5000" }));
+    log(`Capturas de páginas del canal: ${rows.length}`);
+    if (!rows.length) { log("Wayback no tiene capturas de este canal.", "no"); return; }
+    rows = sample(rows, +$("maxcap").value || 80);
+
+    const ids = new Set();
+    let n = 0;
+    await pool(rows, 3, async ([ts, orig]) => {
+      const html = await fetchRaw(ts, orig);
+      if (html) extractIds(html).forEach(v => ids.add(v));
+      n++; progress(0.4 * n / rows.length);
+      status(`Leyendo capturas ${n}/${rows.length} — videos distintos: ${ids.size}`);
+    });
+    log(`Videos distintos encontrados: ${ids.size}`, "ok");
+    if (!ids.size) { log("No se extrajo ningún video (¿CORS bloqueando el replay de Wayback?).", "no"); return; }
+
+    const list = [...ids];
+    let cands = list;
+    const probe = await available("dQw4w9WgXcQ");
+    if (probe === true && !$("all").checked) {
+      cands = []; let k = 0;
+      await pool(list, 4, async v => {
+        const a = await available(v);
+        if (a !== true) cands.push(v);
+        k++; progress(0.4 + 0.2 * k / list.length);
+        status(`Comprobando disponibilidad ${k}/${list.length}`);
+      });
+      log(`Borrados/privados (o no verificables): ${cands.length}`, "ok");
+    } else if (probe !== true) {
+      log("No se pudo consultar si siguen disponibles (bloqueo del navegador); se revisan todos.", "no");
+    }
+
+    let k = 0;
+    await pool(cands, 2, async v => {
+      try {
+        const r = await cdx({ url: "youtube.com/watch?v=" + v, filter: "statuscode:200", fl: "timestamp", limit: "1" });
+        if (r.length) { out.push(`https://web.archive.org/web/${r[0][0]}/https://www.youtube.com/watch?v=${v}`); log("✔ " + v, "ok"); }
+        else log("✘ " + v, "no");
+      } catch (e) { log("! " + v + " (error de red)", "no"); }
+      k++; progress(0.6 + 0.4 * k / cands.length);
+      status(`Buscando capturas de videos ${k}/${cands.length} — recuperables: ${out.length}`);
+    });
+    progress(1);
+    status(`Listo: ${out.length} videos con captura.`);
+    $("dl").disabled = !out.length;
+  } catch (e) {
+    log("Error: " + e.message, "no");
+  } finally { $("go").disabled = false; }
+};
+
+$("dl").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([out.join("\n") + "\n"], { type: "text/plain" }));
+  a.download = "wayback-canal.txt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+</script>
+</body>
+</html>
